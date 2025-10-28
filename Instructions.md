@@ -21,7 +21,7 @@ Given a dummy “customer” API that returns unstructured text about orders, bu
 
 ### Constraints
 - Use LangChain or LangGraph.
-- Use openai/gpt-oss-120b:exacto from [openrouter.ai](https://openrouter.ai/). (if you run out of free credits or need an api key, email us at mlteam@teamraft.com)
+- Use `openai/gpt-oss-120b:exacto` from [openrouter.ai](https://openrouter.ai/). (if you run out of free credits or need an api key, email us at mlteam@teamraft.com)
 - Provide architecture diagram (simple text is fine).
 - Include logging and error handling.
 - Must run with one command: npm start or python main.py.
