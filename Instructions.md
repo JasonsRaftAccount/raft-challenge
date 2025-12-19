@@ -31,7 +31,12 @@ Given a dummy “customer” API that returns unstructured text about orders, bu
 - Correctness and determinism of output.
 - Code structure and simplicity.
 - How well they constrain the LLM.
-  
+
+### Above and Beyond. 
+
+At Raft, we highly value taking the extra step to ensure that we deliver great technology. Here are some ideas if you want to take the extra step here: 
+- Any simple user interface
+- Extend the data, or build simple statistical models (think linear regression), to add some simple traditional predictive system into this system.
 
 ### Starting the provided API
 An API to test with is included in the `dummy_customer_api.py` file. To start it: 
