@@ -6,7 +6,7 @@ These schemas serve two purposes:
 1. Constrain LLM output to predictable structure (prevents hallucination)
 2. Provide type validation for parsed order data
 
-For factual validation (verifying against source data), see validation.py
+For factual validation; verifying against source data, see validation.py
 """
 
 from pydantic import BaseModel, Field, field_validator, ValidationError

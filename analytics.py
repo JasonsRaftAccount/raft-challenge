@@ -3,9 +3,6 @@
 Analytics module for order data.
 - Summary statistics
 - Logistic regression to predict order returns
-
-Installation:
-    pip install pandas scikit-learn
 """
 
 import pandas as pd
@@ -26,7 +23,7 @@ def parse_raw_order(raw: str) -> Order | None:
     """Parse raw order string into Order object for analytics."""
     try:
         anchor = extract_anchors(raw)
-        buyer = re.search(r"Buyer=([^,]+),", raw).group(1)
+        buyer = re.search(r"Buyer=([^,]+),", raw).group(1)  # TODO: fix attr if None
         city = re.search(r"Location=([^,]+),", raw).group(1)
         items_match = re.findall(r"([^,]+?) \((\d+\.?\d*)\*\)", raw)
 
@@ -47,7 +44,7 @@ def parse_raw_order(raw: str) -> Order | None:
 
 
 def orders_to_dataframe(orders: list[Order]) -> pd.DataFrame:
-    """Convert list of Order objects to DataFrame with ML features."""
+    """Convert list of Order objects to DataFrame for ML features."""
     features = [AnalyticsFeatures.from_order(o) for o in orders]
     return pd.DataFrame([f.model_dump() for f in features])
 

@@ -9,7 +9,7 @@ import pandas as pd
 
 from config import setup_logging
 from agent import run_agent
-from api_client import fetch_orders, fetch_order, APIError
+from api_client import fetch_order, APIError
 from schemas import Order
 from analytics import (
     orders_to_dataframe,
@@ -19,7 +19,10 @@ from analytics import (
 )
 
 # logs
+
 setup_logging()
+
+# Headers
 
 st.set_page_config(page_title="OMG Tech Challenge", layout="wide")
 header_left, header_right = st.columns([1, 20])

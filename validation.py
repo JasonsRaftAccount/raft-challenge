@@ -4,9 +4,6 @@ Regex-based factual validation for LLM outputs.
 
 Purpose: Verify that LLM-parsed values match the source data.
 Pydantic validates structure; this validates accuracy.
-
-Installation:
-    No additional dependencies (uses stdlib re module)
 """
 
 import re

@@ -15,15 +15,15 @@ def calculate_return_probability(avg_rating: float) -> float:
     """
     Calculate probability of order return based on average item rating.
 
-    SIMULATED RELATIONSHIP FOR DEMONSTRATION PURPOSES:
-    In a real-world setting, this linear relationship would be derived from
+    SIMULATED RELATIONSHIP FOR DEMONSTRATION PURPOSES.
+    This linear relationship would be derived from
     historical order data and industry benchmarks. E-commerce return rates
     typically range from 15-30% overall, with strong correlation to customer
-    satisfaction metrics like product ratings.
+    satisfaction metrics like product ratings; driving sim use case.
 
     This simulation uses a simple linear model:
-    - Rating 1.0 → 50% return probability (dissatisfied customer)
-    - Rating 5.0 → 5% return probability (satisfied customer)
+    - Rating 1.0 --> 50% return probability (dissatisfied customer)
+    - Rating 5.0 --> 5% return probability (satisfied customer)
 
     Formula: return_prob = 0.50 - (avg_rating - 1.0) * 0.1125
     """
