@@ -1,39 +1,41 @@
-# file: app.py
+# app.py
 """
 Streamlit UI for the order parsing agent.
-Run streamlit run app.py
+
+Usage:
+    streamlit run app.py
 """
 
 import streamlit as st
 import pandas as pd
 
-from config import setup_logging
 from agent import run_agent
-from api_client import fetch_order, APIError
-from schemas import Order
 from analytics import (
     orders_to_dataframe,
+    predict_return,
     summary_stats,
     train_return_model,
-    predict_return,
 )
+from clients import APIError, fetch_order_async
+from schemas import Order
+from utils import setup_logging
 
-# logs
+import asyncio
 
 setup_logging()
 
-# Headers
+st.set_page_config(page_title="Order Parsing Agent", layout="wide")
 
-st.set_page_config(page_title="OMG Tech Challenge", layout="wide")
 header_left, header_right = st.columns([1, 20])
 with header_left:
     st.image("assets/derp-face-open-mouth.png", width=80)
 with header_right:
     st.title("Order Parsing Agent")
 
-tab1, tab2, tab3 = st.tabs(["Query Orders", "Single Order", "Analytics"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Query Orders", "Single Order", "Analytics", "Dead Letter Queue"]
+)
 
-# TAB 1: Natural Language Query
 
 with tab1:
     st.subheader("Natural Language Query")
@@ -49,19 +51,25 @@ with tab1:
         else:
             with st.spinner("Processing..."):
                 result = run_agent(query)
+                st.session_state["last_result"] = result
 
-            if result.get("error"):
-                st.error(result["error"])
-            elif not result["orders"]:
+            if result.meta.total_valid == 0:
                 st.info("No orders matched your query")
             else:
-                st.success(f"Found {len(result['orders'])} orders")
-                st.dataframe(pd.DataFrame(result["orders"]), width="stretch")
+                st.success(
+                    f"Found {result.meta.total_valid} orders "
+                    f"({result.meta.success_rate:.1%} success rate)"
+                )
+
+                response = result.to_query_response()
+                st.dataframe(
+                    pd.DataFrame([o.model_dump() for o in response.orders]),
+                    width="stretch",
+                )
 
                 with st.expander("View JSON"):
-                    st.json(result)
+                    st.json(response.model_dump())
 
-# TAB 2: Single Order Lookup
 
 with tab2:
     st.subheader("Single Order Lookup")
@@ -73,7 +81,7 @@ with tab2:
             st.warning("Please enter an order ID")
         else:
             try:
-                raw_order = fetch_order(order_id)
+                raw_order = asyncio.run(fetch_order_async(order_id))
                 if raw_order is None:
                     st.error(f"Order {order_id} not found")
                 else:
@@ -81,7 +89,6 @@ with tab2:
             except APIError as e:
                 st.error(str(e))
 
-# TAB 3: Analytics
 
 with tab3:
     st.subheader("Analytics & Return Prediction")
@@ -97,17 +104,15 @@ with tab3:
                 st.info("Using cached orders")
             else:
                 with st.spinner("Fetching and parsing orders via LLM..."):
-                    try:
-                        result = run_agent("Show me all orders", full_output=True)
-                        if result.get("error"):
-                            st.error(result["error"])
-                            orders = []
-                        else:
-                            orders = [Order(**o) for o in result["orders"]]
-                            st.session_state["orders_cache"] = orders
-                    except APIError as e:
-                        st.error(str(e))
+                    result = run_agent("Show me all orders")
+
+                    if result.meta.total_valid == 0:
+                        st.error("No orders parsed")
                         orders = []
+                    else:
+                        orders = result.valid_orders
+                        st.session_state["orders_cache"] = orders
+                        st.session_state["last_result"] = result
 
             if orders:
                 df = orders_to_dataframe(orders)
@@ -119,8 +124,6 @@ with tab3:
                 st.session_state["model_results"] = results
 
                 st.success(f"Loaded {len(orders)} orders")
-            else:
-                st.error("No orders parsed")
 
         if "stats" in st.session_state:
             stats = st.session_state["stats"]
@@ -145,7 +148,7 @@ with tab3:
             st.markdown("**Predict Return Probability**")
 
             avg_rating = st.slider("Avg Rating", 1.0, 5.0, 3.0, 0.1)
-            order_total = st.number_input("Order Total ($)", 10.0, 2000.0, 100.0)
+            order_total = st.number_input("Order Total ($)", 10.0, 5000.0, 100.0)
             item_count = st.number_input("Item Count", 1, 10, 2)
 
             if st.button("Predict"):
@@ -157,8 +160,54 @@ with tab3:
                 )
                 prob = pred["return_probability"]
                 if prob > 0.5:
-                    st.error(f"PANIC!!! High return risk: {prob:.0%}")
+                    st.error(f"High return risk: {prob:.0%}")
                 else:
-                    st.success(f"CHILL... Low return risk: {prob:.0%}")
+                    st.success(f"Low return risk: {prob:.0%}")
         else:
             st.info("Click 'Load Data & Train Model' first")
+
+
+with tab4:
+    st.subheader("Dead Letter Queue")
+
+    if "last_result" not in st.session_state:
+        st.info("Run a query first to see failures")
+    else:
+        result = st.session_state["last_result"]
+        dlq = result.dlq
+
+        st.metric("Total Failures", dlq.total_failures)
+
+        if dlq.failed_batches:
+            st.markdown("**Failed Batches (Parse Stage)**")
+            for batch in dlq.failed_batches:
+                with st.expander(
+                    f"Batch {batch.batch_index} - {len(batch.raw_orders)} orders"
+                ):
+                    st.text(f"Error: {batch.error}")
+                    st.text(f"Attempts: {batch.attempts}")
+                    st.text(f"Failed at: {batch.failed_at}")
+                    st.markdown("**Raw orders:**")
+                    for order in batch.raw_orders:
+                        st.code(order)
+
+        if dlq.failed_records:
+            st.markdown("**Failed Records (Validation Stage)**")
+            records_data = []
+            for record in dlq.failed_records:
+                records_data.append(
+                    {
+                        "Order ID": record.orderId or "N/A",
+                        "Type": record.failureType,
+                        "Reason": record.reason,
+                        "Snippet": (
+                            record.rawSnippet[:50] + "..."
+                            if record.rawSnippet
+                            else "N/A"
+                        ),
+                    }
+                )
+            st.dataframe(pd.DataFrame(records_data), width="stretch")
+
+        if dlq.total_failures == 0:
+            st.success("No failures recorded")

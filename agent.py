@@ -1,220 +1,303 @@
-# file: agent.py
+# agent.py
 """
-LangGraph Agent for parsing and filtering order data.
-
-START --> [fetch] (Call API, get raw orders)
-[fetch] --> [parse] (LLM parses + filters orders + check structure)
-[parse] --> [validate] (Check LLM output against regex anchors)
-[validate] --> END
-
-With queries like, "Show me all orders from Ohio over $500"
-1. Fetches raw order data from the API
-2. Sends raw data + user query to LLM for parsing AND filtering
-3. Validates LLM output against regex anchors (slow but high fidelity)
-4. Returns structured JSON
+LangGraph agent for the order parsing agent.
+Orchestrates fetch, parse, and validate stages with parallel processing and retry.
 """
 
-import json
-import re
+import asyncio
 import logging
-from typing import TypedDict, Optional
+from typing import Any, Optional, TypedDict
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
-from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
 
 import config
-from api_client import fetch_orders, APIError
-from schemas import safe_parse_response
-from validation import build_anchor_index, validate_order
+from clients import APIError, fetch_orders_async, get_async_llm
+from prompts import SYSTEM_PROMPT
+from schemas import (
+    AgentResult,
+    DeadLetterQueue,
+    Order,
+    QueryMeta,
+    RawOrderStore,
+)
+from validation import (
+    parse_json_response,
+    validate_batch,
+    validate_schema,
+)
 
 logger = logging.getLogger(__name__)
 
-# SYSTEM PROMPT - Defines how LLM should parse and filter orders
-
-SYSTEM_PROMPT = """You parse multiple raw order strings into JSON and filter based on user criteria.
-
-INPUT: Raw order strings (e.g., "Order 1001: Buyer=John Davis, Location=Columbus, OH, Total=$742.10, Items: laptop (4.2*), Returned=No") + a natural language query (e.g., "orders from Ohio over $500")
-OUTPUT:
-- Return compact JSON with no extra whitespace, newlines, or indentation.
-- Example: {"orders":[{"orderId":"1001","buyer":"John Davis","city":"Columbus","state":"OH","total":742.10,"items":[{"name":"laptop","rating":4.2}],"returned":false}]}
-
-Parsing rules:
-- orderId: digits only, as string
-- state: 2-letter uppercase
-- total: number without $ sign
-- rating: number before * symbol
-- returned: "Yes" = true, "No" = false
-
-Field inference:
-- Field names or formatting in the raw data may change between requests.
-- Use context to infer the correct mapping. For example, "Customer:" means the same as "Buyer=", "Amount:" means the same as "Total=".
-- If a field is genuinely absent from a record, omit that entire order from the output rather than guessing.
-
-Filtering rules:
-- Apply the user's query as a filter
-- Only include orders that match ALL criteria in the query
-- If no orders match, return {"orders": []}
-"""
-
-# STATE - Data that flows through the graph
-
 
 class AgentState(TypedDict):
-    query: str  # User's natural language query
-    raw_orders: list[str]  # Raw strings from API
-    anchor_index: dict  # Regex ground truth for validation
-    parsed_orders: list[dict]  # LLM output
-    valid_orders: list[dict]  # After validation
+    """State flowing through the LangGraph pipeline."""
+
+    query: str
+    raw_store: Optional[dict]
+    parsed_orders: list[dict]
+    valid_orders: list[dict]
+    dlq: dict
     error: Optional[str]
 
 
-# LLM
+async def parse_batch(
+    chunk: list[str],
+    query: str,
+    llm: Any,
+    semaphore: asyncio.Semaphore,
+    batch_index: int,
+) -> tuple[list[Order], Optional[str]]:
+    """
+    Parse a batch of raw orders via LLM.
 
+    Args:
+        chunk: List of raw order strings.
+        query: User's natural language query.
+        llm: Async LLM client.
+        semaphore: Concurrency control semaphore.
+        batch_index: Index of this batch for logging.
 
-def get_llm() -> ChatOpenAI:
-    return ChatOpenAI(
-        model=config.LLM_MODEL,
-        base_url=config.LLM_BASE_URL,
-        api_key=config.LLM_API_KEY,
-        temperature=config.LLM_TEMPERATURE,
-        max_tokens=config.MAX_TOKENS,
-        max_retries=3,
-        request_timeout=60,  # TODO: move to configs
-    )
+    Returns:
+        Tuple of (list of valid Order objects, error message if failed).
+    """
+    user_content = f"Query: {query}\n\nRaw orders:\n" + "\n".join(chunk)
 
-
-# NODES - Functions / tools
-
-
-def fetch_node(state: AgentState) -> dict:
-    """Fetch orders from API and build anchor index."""
-    try:
-        raw_orders = fetch_orders()
-        anchor_index = build_anchor_index(raw_orders)
-
-        extraction_rate = len(anchor_index) / len(raw_orders) if raw_orders else 0
-        logger.info(
-            f"Fetched {len(raw_orders)} orders, anchor extraction rate: {extraction_rate:.0%}"
-        )
-
-        if extraction_rate < 1.0:
-            logger.warning(
-                f"Anchor extraction failed for {len(raw_orders) - len(anchor_index)} orders — "
-                "format may have changed"
+    async with semaphore:
+        logger.debug("Parsing batch %d with %d orders", batch_index, len(chunk))
+        try:
+            response = await llm.ainvoke(
+                [
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(content=user_content),
+                ]
             )
 
-        return {
-            "raw_orders": raw_orders,
-            "anchor_index": anchor_index,
-        }
+            data = parse_json_response(response.content)
+            if data is None:
+                return [], "Failed to parse LLM response as JSON"
+
+            orders, errors = validate_schema(data)
+
+            if errors:
+                logger.warning(
+                    "Batch %d had %d schema errors: %s",
+                    batch_index,
+                    len(errors),
+                    errors[:3],
+                )
+
+            logger.info(
+                "Batch %d parsed: %d valid orders",
+                batch_index,
+                len(orders),
+            )
+            return orders, None
+
+        except Exception as e:
+            logger.error("Batch %d parse failed: %s", batch_index, e)
+            return [], str(e)
+
+
+async def parse_batch_with_retry(
+    chunk: list[str],
+    query: str,
+    llm: Any,
+    semaphore: asyncio.Semaphore,
+    batch_index: int,
+    max_retries: int = config.MAX_RETRIES,
+    base_delay: float = config.RETRY_BASE_DELAY,
+) -> tuple[list[Order], Optional[str], int]:
+    """
+    Parse a batch with exponential backoff retry.
+
+    Args:
+        chunk: List of raw order strings.
+        query: User's natural language query.
+        llm: Async LLM client.
+        semaphore: Concurrency control semaphore.
+        batch_index: Index of this batch for logging.
+        max_retries: Maximum retry attempts.
+        base_delay: Base delay for exponential backoff.
+
+    Returns:
+        Tuple of (valid orders, error message if all retries failed, attempt count).
+    """
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        orders, error = await parse_batch(chunk, query, llm, semaphore, batch_index)
+
+        if error is None:
+            return orders, None, attempt
+
+        last_error = error
+        if attempt < max_retries:
+            delay = base_delay * (2 ** (attempt - 1))  # exp backoff
+            logger.warning(
+                "Batch %d attempt %d failed, retrying in %.1fs: %s",
+                batch_index,
+                attempt,
+                delay,
+                error,
+            )
+            await asyncio.sleep(delay)
+
+    logger.error(
+        "Batch %d failed after %d attempts: %s",
+        batch_index,
+        max_retries,
+        last_error,
+    )
+    return [], last_error, max_retries
+
+
+async def fetch_node(state: AgentState) -> dict:
+    """
+    Fetch raw orders from the API.
+
+    Args:
+        state: Current agent state.
+
+    Returns:
+        Updated state with raw_store populated.
+    """
+    logger.info("Fetching orders for query: %s", state["query"])
+    try:
+        raw_orders = await fetch_orders_async()
+        raw_store = RawOrderStore(orders=raw_orders)
+        logger.info("Fetched %d orders", len(raw_orders))
+        return {"raw_store": raw_store.model_dump()}
     except APIError as e:
+        logger.error("Fetch failed: %s", e)
         return {"error": str(e)}
 
 
-def parse_node(state: AgentState) -> dict:
-    """Send raw orders + user query to LLM for parsing and filtering."""
-    if state.get("error") or not state["raw_orders"]:
-        return {"parsed_orders": []}
+async def parse_node(state: AgentState) -> dict:
+    """
+    Parse raw orders in parallel batches.
 
-    # Chunk if needed for context window
-    chunks = [
-        state["raw_orders"][i : i + config.CHUNK_SIZE]
-        for i in range(0, len(state["raw_orders"]), config.CHUNK_SIZE)
-    ]
+    Args:
+        state: Current agent state with raw_store.
 
-    llm = get_llm()
+    Returns:
+        Updated state with parsed_orders and dlq.
+    """
+    if state.get("error"):
+        return {"parsed_orders": [], "dlq": DeadLetterQueue().model_dump()}
+
+    raw_store = RawOrderStore.model_validate(state["raw_store"])
+    query = state["query"]
+    dlq = DeadLetterQueue()
+
+    llm = get_async_llm()
+    semaphore = asyncio.Semaphore(config.PARSE_CONCURRENCY)
+
+    total_batches = raw_store.total_batches(config.CHUNK_SIZE)
+    logger.info(
+        "Parsing %d orders in %d batches (chunk size: %d)",
+        len(raw_store.orders),
+        total_batches,
+        config.CHUNK_SIZE,
+    )
+
+    tasks = []
+    for i in range(total_batches):
+        chunk = raw_store.get_batch(i, config.CHUNK_SIZE)
+        tasks.append(parse_batch_with_retry(chunk, query, llm, semaphore, i))
+
+    results = await asyncio.gather(*tasks)
+
     all_orders = []
-
-    for chunk in chunks:
-        # User query + raw data → LLM does parsing AND filtering
-        user_msg = f"Query: {state['query']}\n\nRaw orders:\n" + "\n".join(chunk)
-
-        try:
-            response = llm.invoke(
-                [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=user_msg)]
+    for i, (orders, error, attempts) in enumerate(results):
+        if error:
+            chunk = raw_store.get_batch(i, config.CHUNK_SIZE)
+            dlq.add_batch_failure(
+                batch_index=i,
+                raw_orders=chunk,
+                error=error,
+                attempts=attempts,
             )
-            content = response.content.strip()
-            logger.info(f"Raw LLM response length: {len(content)}")
-            logger.debug(f"Raw LLM response:\n{content[:1000]}")  # First 1000 chars
-
-            # Strip markdown code blocks if present (common w/ gpt family)
-            code_block_match = re.search(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
-            if code_block_match:
-                content = code_block_match.group(1).strip()
-
-            # Skip empty responses
-            if not content.strip():
-                logger.warning("Empty LLM response, skipping chunk")
-                continue
-
-            # Pydantic structure validation
-            parsed = safe_parse_response(json.loads(content))
-            if parsed.error:
-                logger.warning(f"Pydantic validation: {parsed.error}")
-                continue
-
-            # Convert validated Orders to dicts for regex validation
-            orders = [o.model_dump() for o in parsed.orders]
+        else:
             all_orders.extend(orders)
-        except json.JSONDecodeError as e:
-            logger.warning(f"Parse error: {e}")
-            logger.debug(f"Raw LLM response:\n{content[:500]}")  # Log first 500 chars
-        except Exception as e:
-            logger.warning(f"Unexpected error: {e}")
 
-    return {"parsed_orders": all_orders}
+    logger.info(
+        "Parse complete: %d orders parsed, %d batches failed",
+        len(all_orders),
+        len(dlq.failed_batches),
+    )
+
+    return {
+        "parsed_orders": [o.model_dump() for o in all_orders],
+        "dlq": dlq.model_dump(),
+    }
 
 
-def validate_node(state: AgentState) -> dict:
-    """Validate LLM output against regex anchors."""
-    if state.get("error") or not state["parsed_orders"]:
+async def validate_node(state: AgentState) -> dict:
+    """
+    Validate parsed orders via LLM-as-judge.
+
+    Args:
+        state: Current agent state with parsed_orders.
+
+    Returns:
+        Updated state with valid_orders and dlq.
+    """
+    if state.get("error"):
         return {"valid_orders": []}
 
-    anchor_index = state["anchor_index"]
     parsed_orders = state["parsed_orders"]
+    raw_store = RawOrderStore.model_validate(state["raw_store"])
+    dlq = DeadLetterQueue.model_validate(state["dlq"])
 
-    # Schema change detection: if most anchors failed, log it
-    if anchor_index and len(anchor_index) < len(state["raw_orders"]) * 0.5:
-        logger.warning(
-            f"Anchor extraction only succeeded for {len(anchor_index)}/{len(state['raw_orders'])} orders "
-            "— possible API schema change. Orders without anchors will skip regex validation."
-        )
+    if not parsed_orders:
+        logger.warning("No parsed orders to validate")
+        return {"valid_orders": [], "dlq": dlq.model_dump()}
 
-    valid = []
-    skipped = []
+    llm = get_async_llm()
+    semaphore = asyncio.Semaphore(config.VALIDATE_CONCURRENCY)
 
-    for order in parsed_orders:
-        order_id = str(order.get("orderId"))
+    total_batches = (len(parsed_orders) + config.CHUNK_SIZE - 1) // config.CHUNK_SIZE
+    logger.info(
+        "Validating %d orders in %d batches",
+        len(parsed_orders),
+        total_batches,
+    )
 
-        if order_id in anchor_index:
-            # Anchor exists — full regex validation
-            mismatches = validate_order(order, anchor_index[order_id])
-            if mismatches:
-                logger.warning(f"Order {order_id} rejected — mismatches: {mismatches}")
-                skipped.append(order)
-            else:
-                valid.append(order)
-        else:
-            # No anchor (schema change or new format) — trust Pydantic validation only
-            logger.info(
-                f"Order {order_id} has no anchor — accepted via Pydantic validation only"
-            )
-            valid.append(order)
+    tasks = []
+    for i in range(total_batches):
+        start = i * config.CHUNK_SIZE
+        end = start + config.CHUNK_SIZE
+        parsed_chunk = parsed_orders[start:end]
+        # Pass ALL raw orders - validate_batch filters to matching IDs
+        tasks.append(validate_batch(parsed_chunk, raw_store.orders, llm, semaphore))
 
-    if skipped:
-        logger.warning(f"Skipped {len(skipped)} orders with validation mismatches")
+    results = await asyncio.gather(*tasks)
 
-    return {"valid_orders": valid}
+    all_valid = []
+    for valid_orders, failed_records in results:
+        all_valid.extend(valid_orders)
+        for record in failed_records:
+            dlq.failed_records.append(record)
+
+    logger.info(
+        "Validation complete: %d valid, %d failed records",
+        len(all_valid),
+        len(dlq.failed_records),
+    )
+
+    return {
+        "valid_orders": all_valid,
+        "dlq": dlq.model_dump(),
+    }
 
 
-# GRAPH - Connect nodes with edges pretty pretty cool
-
-
-def build_graph():
+def build_graph() -> StateGraph:
     """
-    Build the agent graph:
-    START → fetch → parse → validate → END
+    Construct the LangGraph state machine.
+
+    Returns:
+        Compiled StateGraph ready for execution.
     """
     builder = StateGraph(AgentState)
 
@@ -230,58 +313,71 @@ def build_graph():
     return builder.compile()
 
 
-# Agent API
-
-# build once at mod level
 _graph = build_graph()
 
 
-def run_agent(query: str, full_output: bool = False) -> dict:
+async def run_agent_async(query: str) -> AgentResult:
     """
-    Run the agent with a natural language query.
+    Execute the agent pipeline asynchronously.
 
     Args:
-        query: Natural language query, e.g., "Show me all orders from Ohio over $500"
-        full_output: If True, return all fields. If False, return challenge format only.
+        query: Natural language query for filtering orders.
 
     Returns:
-        {"orders": [...]}
+        AgentResult with valid orders, failures, and metadata.
     """
-    result = _graph.invoke(
-        {
-            "query": query,
-            "raw_orders": [],
-            "anchor_index": {},
-            "parsed_orders": [],
-            "valid_orders": [],
-            "error": None,
-        }
-    )
+    logger.info("Running agent with query: %s", query)
 
-    if result.get("error"):
-        return {"orders": [], "error": result["error"]}
-
-    valid_orders = result.get("valid_orders", [])
-
-    if full_output:
-        return {"orders": valid_orders}
-
-    # Challenge format (only required fields)
-    return {
-        "orders": [
-            {
-                "orderId": o["orderId"],
-                "buyer": o["buyer"],
-                "state": o["state"],
-                "total": o["total"],
-            }
-            for o in valid_orders
-        ]
+    initial_state: AgentState = {
+        "query": query,
+        "raw_store": None,
+        "parsed_orders": [],
+        "valid_orders": [],
+        "dlq": DeadLetterQueue().model_dump(),
+        "error": None,
     }
 
+    result = await _graph.ainvoke(initial_state)
 
-if __name__ == "__main__":
-    import sys
+    raw_store = (
+        RawOrderStore.model_validate(result["raw_store"])
+        if result["raw_store"]
+        else RawOrderStore()
+    )
+    dlq = DeadLetterQueue.model_validate(result["dlq"])
 
-    query = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "Show me all orders"
-    print(json.dumps(run_agent(query), indent=2))
+    valid_orders = [Order.model_validate(o) for o in result["valid_orders"]]
+
+    meta = QueryMeta(
+        total_raw=len(raw_store.orders),
+        total_parsed=len(result["parsed_orders"]),
+        total_valid=len(valid_orders),
+        total_failed=dlq.total_failures,
+    )
+
+    logger.info(
+        "Agent complete: %d/%d orders valid (%.1f%% success rate)",
+        meta.total_valid,
+        meta.total_raw,
+        meta.success_rate * 100,
+    )
+
+    return AgentResult(
+        raw_store=raw_store,
+        valid_orders=valid_orders,
+        dlq=dlq,
+        meta=meta,
+    )
+
+
+def run_agent(query: str) -> AgentResult:
+    """
+    Execute the agent pipeline synchronously.
+
+    Args:
+        query: Natural language query for filtering orders.
+
+    Returns:
+        AgentResult with valid orders, failures, and metadata.
+    """
+    return asyncio.run(run_agent_async(query))

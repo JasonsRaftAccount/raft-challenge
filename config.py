@@ -1,62 +1,54 @@
-# file: config.py
 """
-Configuration for the order parsing agent and logging behavior.
+Configuration management for the order parsing agent.
+
+Loads environment variables and provides validated settings to all modules.
 """
 
 import os
-import logging
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-# centralized logging setup (easier for scope)
-def setup_logging(level=logging.DEBUG):
-    """Configure logging once. Safe to call multiple times (idempotent)."""
-    root = logging.getLogger()
-    if root.handlers:
-        return
-    root.setLevel(level)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-
-    console = logging.StreamHandler()
-    console.setFormatter(fmt)
-    root.addHandler(console)
-
-    file_handler = logging.FileHandler("sys.log")
-    file_handler.setFormatter(fmt)
-    root.addHandler(file_handler)
-
-
-# Provider: openrouter or ollama for local
+# LLM Provider
 PROVIDER = os.getenv("PROVIDER", "openrouter")
 
-# LLM Settings
-if PROVIDER == "ollama":
-    LLM_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-    LLM_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-    LLM_API_KEY = "ollama"
+# OpenRouter Configuration
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b:exacto")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
+# Ollama Configuration
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+
+# Provider Selection
+if PROVIDER == "openrouter":
+    LLM_MODEL = OPENROUTER_MODEL
+    LLM_BASE_URL = OPENROUTER_BASE_URL
+    LLM_API_KEY = OPENROUTER_API_KEY
 else:
-    LLM_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b:exacto")
-    LLM_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-    LLM_API_KEY = os.getenv("OPENROUTER_API_KEY")
+    LLM_MODEL = OLLAMA_MODEL
+    LLM_BASE_URL = OLLAMA_BASE_URL
+    LLM_API_KEY = "ollama"
 
+# LLM Parameters
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0"))
-
-# App Settings
-DUMMY_API_URL = os.getenv("DUMMY_API_URL", "http://localhost:5001")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "30"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
 
-# Validate required config
+# Batch Processing
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "25"))
+PARSE_CONCURRENCY = int(os.getenv("PARSE_CONCURRENCY", "10"))
+VALIDATE_CONCURRENCY = int(os.getenv("VALIDATE_CONCURRENCY", "10"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+RETRY_BASE_DELAY = float(os.getenv("RETRY_BASE_DELAY", "10.0"))  # 10 sec retry
+
+# API Configuration
+DUMMY_API_URL = os.getenv("DUMMY_API_URL", "http://localhost:5001")
+
+# Validation
 if PROVIDER == "openrouter" and not LLM_API_KEY:
     raise ValueError(
         "OPENROUTER_API_KEY is required when PROVIDER=openrouter. "
         "Set it in your .env file."
     )
-
-if __name__ == "__main__":
-    print(f"Provider: {PROVIDER}")
-    print(f"Model: {LLM_MODEL}")
-    print(f"Base URL: {LLM_BASE_URL}")
-    # print(f"API Key set: {bool(LLM_API_KEY)}")

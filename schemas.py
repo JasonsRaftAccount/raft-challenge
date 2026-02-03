@@ -1,169 +1,250 @@
-# file: schemas.py
+# schemas.py
 """
-Pydantic schemas for order data validation (structural validation).
+Pydantic models for the order parsing agent.
 
-These schemas serve two purposes:
-1. Constrain LLM output to predictable structure (prevents hallucination)
-2. Provide type validation for parsed order data
-
-For factual validation; verifying against source data, see validation.py
+Defines all data structures for orders, failures, and responses used
+throughout the pipeline.
 """
 
-from pydantic import BaseModel, Field, field_validator, ValidationError
-from typing import Optional
-import logging
+from datetime import datetime
+from typing import Literal, Optional
 
-logger = logging.getLogger(__name__)
-
-
-def safe_parse_order(data: dict) -> tuple["Order | None", "str | None"]:
-    """
-    Safely parse order dict into Order model.
-
-    Args:
-        data: Dict from LLM output
-
-    Returns:
-        Tuple of (Order, None) on success or (None, error_message) on failure
-    """
-    try:
-        return Order.model_validate(data), None
-    except ValidationError as e:
-        error_msg = f"Pydantic validation failed: {e.error_count()} errors"
-        logger.warning(f"Order parse failed: {error_msg}")
-        for error in e.errors():
-            logger.debug(f"  - {error['loc']}: {error['msg']}")
-        return None, error_msg
-
-
-def safe_parse_response(data: dict) -> "QueryResponse":
-    """
-    Safely parse LLM response, returning error response on failure.
-
-    Args:
-        data: Dict from LLM output, expected to have 'orders' key
-
-    Returns:
-        QueryResponse (with orders or error message)
-    """
-    try:
-        return QueryResponse.model_validate(data)
-    except ValidationError as e:
-        error_msg = f"Failed to parse LLM response: {e.error_count()} validation errors"
-        logger.error(error_msg)
-        return QueryResponse(orders=[], error=error_msg)
+from pydantic import BaseModel, Field
 
 
 class OrderItem(BaseModel):
-    """Individual item within an order."""
+    """Single item within an order."""
 
-    name: str = Field(..., description="Product name")
-    rating: float = Field(..., ge=1.0, le=5.0, description="Item rating 1-5 stars")
+    name: str = Field(description="Product name")
+    rating: float = Field(ge=1.0, le=5.0, description="Customer rating 1.0-5.0")
 
 
 class Order(BaseModel):
-    """
-    Structured order matching challenge output requirements.
+    """Full parsed order with all fields."""
 
-    Example output:
-        { "orderId": "1001", "buyer": "John Davis", "state": "OH", "total": 742.10 }
-    """
+    orderId: str = Field(description="Unique order identifier")
+    buyer: str = Field(description="Customer name")
+    city: str = Field(description="City name")
+    state: str = Field(min_length=2, max_length=2, description="Two-letter state code")
+    total: float = Field(gt=0, description="Order total in dollars")
+    items: list[OrderItem] = Field(description="List of items with ratings")
+    returned: bool = Field(description="Whether order was returned")
 
-    orderId: str = Field(..., description="Order ID (numeric string)")
-    buyer: str = Field(..., description="Buyer full name")
-    city: str = Field(..., description="City name")
-    state: str = Field(
-        ..., min_length=2, max_length=2, description="2-letter state code"
-    )
-    total: float = Field(..., gt=0, description="Order total in dollars")
-    items: list[OrderItem] = Field(
-        ..., min_length=1, description="List of items with ratings"
-    )
-    returned: bool = Field(..., description="Whether order was returned")
-
-    @field_validator("state")
-    @classmethod
-    def state_must_be_uppercase(cls, v: str) -> str:
-        return v.upper()
-
-    @field_validator("orderId")
-    @classmethod
-    def order_id_must_be_numeric(cls, v: str) -> str:
-        if not v.isdigit():
-            raise ValueError("orderId must contain only digits")
-        return v
-
-    @property
-    def avg_rating(self) -> float:
-        """Calculate average rating across all items."""
-        if not self.items:
-            return 0.0
-        return sum(item.rating for item in self.items) / len(self.items)
-
-    @property
-    def item_count(self) -> int:
-        """Number of items in order."""
-        return len(self.items)
-
-    def to_challenge_format(self) -> dict:
+    def to_summary(self) -> "OrderSummary":
         """
-        Return order in the exact format specified by challenge requirements.
+        Convert to minimal summary format for query responses.
 
         Returns:
-            { "orderId": "...", "buyer": "...", "state": "OH", "total": 742.10 }
+            OrderSummary with orderId, buyer, state, and total only.
         """
-        return {
-            "orderId": self.orderId,
-            "buyer": self.buyer,
-            "state": self.state,
-            "total": self.total,
-        }
+        return OrderSummary(
+            orderId=self.orderId,
+            buyer=self.buyer,
+            state=self.state,
+            total=self.total,
+        )
+
+
+class OrderSummary(BaseModel):
+    """Minimal order format for query responses."""
+
+    orderId: str
+    buyer: str
+    state: str
+    total: float
+
+
+class RawOrderStore(BaseModel):
+    """Storage for raw order strings from the API."""
+
+    orders: list[str] = Field(default_factory=list, description="Raw order strings")
+    fetched_at: datetime = Field(default_factory=datetime.now)
+
+    def get_batch(self, batch_index: int, batch_size: int) -> list[str]:
+        """
+        Retrieve a batch of raw orders by index.
+
+        Args:
+            batch_index: Zero-based batch number.
+            batch_size: Number of orders per batch.
+
+        Returns:
+            List of raw order strings for the specified batch.
+        """
+        start = batch_index * batch_size
+        end = start + batch_size
+        return self.orders[start:end]
+
+    def total_batches(self, batch_size: int) -> int:
+        """
+        Calculate total number of batches.
+
+        Args:
+            batch_size: Number of orders per batch.
+
+        Returns:
+            Number of batches needed to process all orders.
+        """
+        return (len(self.orders) + batch_size - 1) // batch_size
+
+
+class FailedBatch(BaseModel):
+    """Record of a batch that failed structural validation."""
+
+    batch_index: int = Field(description="Zero-based batch number")
+    raw_orders: list[str] = Field(description="Raw orders in the failed batch")
+    error: str = Field(description="Error message describing the failure")
+    attempts: int = Field(default=1, description="Number of retry attempts made")
+    failed_at: datetime = Field(default_factory=datetime.now)
+
+
+class FailedRecord(BaseModel):
+    """Record of an individual order that failed semantic validation."""
+
+    orderId: Optional[str] = Field(
+        default=None, description="Order ID for mismatch or hallucinated failures"
+    )
+    rawSnippet: Optional[str] = Field(
+        default=None, description="First 100 chars of raw order for dropped failures"
+    )
+    failureType: Literal["mismatch", "hallucinated"] = Field(
+        description="Category of validation failure"
+    )
+    reason: str = Field(description="Specific reason for failure")
+    failed_at: datetime = Field(default_factory=datetime.now)
+
+
+class DeadLetterQueue(BaseModel):
+    """Aggregates all failures from parse and validation stages."""
+
+    failed_batches: list[FailedBatch] = Field(default_factory=list)
+    failed_records: list[FailedRecord] = Field(default_factory=list)
+
+    @property
+    def total_failures(self) -> int:
+        """
+        Count total failed orders across batches and individual records.
+
+        Returns:
+            Total number of orders that failed processing.
+        """
+        batch_orders = sum(len(b.raw_orders) for b in self.failed_batches)
+        return batch_orders + len(self.failed_records)
+
+    def add_batch_failure(
+        self,
+        batch_index: int,
+        raw_orders: list[str],
+        error: str,
+        attempts: int = 1,
+    ) -> None:
+        """
+        Record a batch that failed structural validation.
+
+        Args:
+            batch_index: Zero-based batch number.
+            raw_orders: Raw order strings in the failed batch.
+            error: Error message describing the failure.
+            attempts: Number of retry attempts made.
+        """
+        self.failed_batches.append(
+            FailedBatch(
+                batch_index=batch_index,
+                raw_orders=raw_orders,
+                error=error,
+                attempts=attempts,
+            )
+        )
+
+    def add_record_failure(
+        self,
+        failure_type: Literal["mismatch", "dropped", "hallucinated"],
+        reason: str,
+        order_id: Optional[str] = None,
+        raw_snippet: Optional[str] = None,
+    ) -> None:
+        """
+        Record an individual order that failed semantic validation.
+
+        Args:
+            failure_type: Category of failure (mismatch, dropped, hallucinated).
+            reason: Specific reason for failure.
+            order_id: Order ID for mismatch/hallucinated failures.
+            raw_snippet: Raw order snippet for dropped failures.
+        """
+        self.failed_records.append(
+            FailedRecord(
+                orderId=order_id,
+                rawSnippet=raw_snippet[:100] if raw_snippet else None,
+                failureType=failure_type,
+                reason=reason,
+            )
+        )
+
+
+class QueryMeta(BaseModel):
+    """Metadata about query execution."""
+
+    total_raw: int = Field(description="Orders fetched from API")
+    total_parsed: int = Field(description="Orders successfully parsed")
+    total_valid: int = Field(description="Orders that passed validation")
+    total_failed: int = Field(description="Orders in dead letter queue")
+
+    @property
+    def success_rate(self) -> float:
+        """
+        Calculate percentage of successfully processed orders.
+
+        Returns:
+            Success rate as a decimal (0.0 to 1.0).
+        """
+        if self.total_raw == 0:
+            return 1.0
+        return self.total_valid / self.total_raw
 
 
 class QueryResponse(BaseModel):
-    """
-    Response structure for agent queries.
+    """Response format for CLI and Query tab."""
 
-    Example:
-        {
-            "orders": [
-                { "orderId": "1001", "buyer": "John Davis", "state": "OH", "total": 742.10 }
-            ],
-            "error": null
-        }
-    """
-
-    orders: list[Order] = Field(
-        default_factory=list, description="List of matching orders"
-    )
-    error: Optional[str] = Field(
-        default=None, description="Error message if query failed"
-    )
-
-    def to_challenge_format(self) -> dict:
-        """Return response in challenge-specified format."""
-        return {"orders": [order.to_challenge_format() for order in self.orders]}
+    orders: list[OrderSummary] = Field(description="Validated order summaries")
+    meta: QueryMeta = Field(description="Execution statistics")
 
 
-class AnalyticsFeatures(BaseModel):
-    """
-    Features extracted from orders for classification model.
-    Used to predict return probability.
-    """
+class AnalyticsData(BaseModel):
+    """Response format for Analytics tab with full order details."""
 
-    orderId: str
-    avg_rating: float = Field(..., ge=1.0, le=5.0)
-    order_total: float = Field(..., gt=0)
-    item_count: int = Field(..., ge=1)
-    returned: bool
+    orders: list[Order] = Field(description="Full validated orders for analysis")
+    meta: QueryMeta = Field(description="Execution statistics")
 
-    @classmethod
-    def from_order(cls, order: Order) -> "AnalyticsFeatures":
-        """Convert Order to analytics features."""
-        return cls(
-            orderId=order.orderId,
-            avg_rating=order.avg_rating,
-            order_total=order.total,
-            item_count=order.item_count,
-            returned=order.returned,
+
+class AgentResult(BaseModel):
+    """Complete result from agent execution."""
+
+    raw_store: RawOrderStore = Field(description="Raw orders from API")
+    valid_orders: list[Order] = Field(description="Orders that passed all validation")
+    dlq: DeadLetterQueue = Field(description="All processing failures")
+    meta: QueryMeta = Field(description="Execution statistics")
+
+    def to_query_response(self) -> QueryResponse:
+        """
+        Format result for CLI and Query tab.
+
+        Returns:
+            QueryResponse with order summaries and metadata.
+        """
+        return QueryResponse(
+            orders=[o.to_summary() for o in self.valid_orders],
+            meta=self.meta,
+        )
+
+    def to_analytics_data(self) -> AnalyticsData:
+        """
+        Format result for Analytics tab.
+
+        Returns:
+            AnalyticsData with full orders and metadata.
+        """
+        return AnalyticsData(
+            orders=self.valid_orders,
+            meta=self.meta,
         )

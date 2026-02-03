@@ -1,57 +1,63 @@
-# file: analytics.py
+# analytics.py
 """
 Analytics module for order data.
-- Summary statistics
-- Logistic regression to predict order returns
+
+Provides summary statistics and logistic regression model
+to predict order returns based on rating, total, and item count.
 """
 
-import pandas as pd
 import logging
-import re
-from sklearn.model_selection import train_test_split
+
+import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.model_selection import train_test_split
 
-from validation import extract_anchors, AnchorExtractionError
-from schemas import Order, OrderItem, AnalyticsFeatures
+from schemas import Order
 
 logger = logging.getLogger(__name__)
 
 
-# TODO: Can fallback to regex after failed LLM call on analytics.
-def parse_raw_order(raw: str) -> Order | None:
-    """Parse raw order string into Order object for analytics."""
-    try:
-        anchor = extract_anchors(raw)
-        buyer = re.search(r"Buyer=([^,]+),", raw).group(1)  # TODO: fix attr if None
-        city = re.search(r"Location=([^,]+),", raw).group(1)
-        items_match = re.findall(r"([^,]+?) \((\d+\.?\d*)\*\)", raw)
-
-        if not items_match:
-            return None
-
-        return Order(
-            orderId=anchor.orderId,
-            buyer=buyer,
-            city=city,
-            state=anchor.state,
-            total=anchor.total,
-            items=[OrderItem(name=n.strip(), rating=float(r)) for n, r in items_match],
-            returned=anchor.returned,
-        )
-    except (AttributeError, AnchorExtractionError):
-        return None
-
-
 def orders_to_dataframe(orders: list[Order]) -> pd.DataFrame:
-    """Convert list of Order objects to DataFrame for ML features."""
-    features = [AnalyticsFeatures.from_order(o) for o in orders]
-    return pd.DataFrame([f.model_dump() for f in features])
+    """
+    Convert list of Order objects to DataFrame with ML features.
+
+    Args:
+        orders: List of validated Order objects.
+
+    Returns:
+        DataFrame with columns: avg_rating, order_total, item_count, returned.
+    """
+    rows = []
+    for order in orders:
+        avg_rating = sum(item.rating for item in order.items) / len(order.items)
+        rows.append(
+            {
+                "order_id": order.orderId,
+                "avg_rating": round(avg_rating, 2),
+                "order_total": order.total,
+                "item_count": len(order.items),
+                "returned": order.returned,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    logger.debug("Created DataFrame with %d orders", len(df))
+    return df
 
 
 def summary_stats(df: pd.DataFrame) -> dict:
-    """Calculate basic summary statistics."""
-    return {
+    """
+    Calculate summary statistics from order DataFrame.
+
+    Args:
+        df: DataFrame from orders_to_dataframe().
+
+    Returns:
+        Dict with total_orders, total_revenue, avg_order_value,
+        return_rate, avg_rating, avg_items_per_order.
+    """
+    stats = {
         "total_orders": len(df),
         "total_revenue": round(df["order_total"].sum(), 2),
         "avg_order_value": round(df["order_total"].mean(), 2),
@@ -59,41 +65,48 @@ def summary_stats(df: pd.DataFrame) -> dict:
         "avg_rating": round(df["avg_rating"].mean(), 2),
         "avg_items_per_order": round(df["item_count"].mean(), 2),
     }
+    logger.info(
+        "Summary: %d orders, $%.2f revenue, %.1f%% return rate",
+        stats["total_orders"],
+        stats["total_revenue"],
+        stats["return_rate"],
+    )
+    return stats
 
 
 def train_return_model(df: pd.DataFrame) -> dict:
     """
     Train logistic regression to predict order returns.
 
-    Features: avg_rating, order_total, item_count
-    Target: returned (True/False)
+    Args:
+        df: DataFrame from orders_to_dataframe().
 
-    Returns dict with model, metrics, and feature importance.
+    Returns:
+        Dict with model, accuracy, confusion_matrix, feature_importance,
+        train_size, and test_size.
     """
-    # Features and target
     X = df[["avg_rating", "order_total", "item_count"]]
     y = df["returned"]
 
-    # Split: 80% train, 20% test
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
 
-    # Train
     model = LogisticRegression(random_state=42)
     model.fit(X_train, y_train)
 
-    # Evaluate
     y_pred = model.predict(X_test)
     accuracy = accuracy_score(y_test, y_pred)
     cm = confusion_matrix(y_test, y_pred, labels=[False, True])
 
-    logger.info(
-        f"Trained model: accuracy={accuracy:.3f}, train_size={len(X_train)}, test_size={len(X_test)}"
-    )
-
-    # Feature importance (coefficients)
     importance = dict(zip(X.columns, model.coef_[0]))
+
+    logger.info(
+        "Model trained: accuracy=%.3f, train_size=%d, test_size=%d",
+        accuracy,
+        len(X_train),
+        len(X_test),
+    )
 
     return {
         "model": model,
@@ -106,15 +119,33 @@ def train_return_model(df: pd.DataFrame) -> dict:
 
 
 def predict_return(
-    model: LogisticRegression, avg_rating: float, order_total: float, item_count: int
+    model: LogisticRegression,
+    avg_rating: float,
+    order_total: float,
+    item_count: int,
 ) -> dict:
-    """Predict return probability for a single order."""
+    """
+    Predict return probability for a single order.
+
+    Args:
+        model: Trained LogisticRegression model.
+        avg_rating: Average item rating (1.0-5.0).
+        order_total: Order total in dollars.
+        item_count: Number of items in order.
+
+    Returns:
+        Dict with will_return (bool) and return_probability (float).
+    """
     proba = model.predict_proba([[avg_rating, order_total, item_count]])[0]
-    return {
+    result = {
         "will_return": bool(proba[1] > 0.5),
         "return_probability": round(proba[1], 3),
     }
-
-
-if __name__ == "__main__":
-    print("Analytics module loaded. Import and use in app.py")
+    logger.debug(
+        "Prediction: rating=%.1f, total=%.2f, items=%d -> %.1f%% return probability",
+        avg_rating,
+        order_total,
+        item_count,
+        result["return_probability"] * 100,
+    )
+    return result
